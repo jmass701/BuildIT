@@ -3,8 +3,9 @@ import { api, type User } from "./api";
 import { AuthPage } from "./pages/Auth";
 import { Dashboard } from "./pages/Dashboard";
 import { ProjectPage } from "./pages/Project";
+import { WorkspacePage } from "./pages/Workspace";
 
-/** Tiny history-based router: "/" and "/projects/:id". */
+/** Tiny history-based router: "/", "/projects/:id" and "/workspaces/:id". */
 export function navigate(path: string) {
   history.pushState(null, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
@@ -39,5 +40,7 @@ export function App() {
 
   const m = /^\/projects\/([\w-]+)/.exec(path);
   if (m) return <ProjectPage key={m[1]} id={m[1]} />;
+  const w = /^\/workspaces\/([\w-]+)/.exec(path);
+  if (w) return <WorkspacePage key={w[1]} id={w[1]} user={user} />;
   return <Dashboard user={user} onLogout={logout} />;
 }

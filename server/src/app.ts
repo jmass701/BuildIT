@@ -7,7 +7,9 @@ import type { DB } from "./db.ts";
 import type { Generator } from "./generator/index.ts";
 import { builderRouter } from "./builder.ts";
 import { errorHandler, runtimeRouter } from "./runtime.ts";
-import { hostingRouter, subdomainHost } from "./hosting.ts";
+import { appHost, hostingRouter } from "./hosting.ts";
+import { uploadsRouter } from "./uploads.ts";
+import type { TxtResolver } from "./domains.ts";
 
 export interface AppOptions {
   db: DB;
@@ -16,6 +18,8 @@ export interface AppOptions {
   appsDomain?: string;
   /** Directory with the built builder UI (web/dist); served when present. */
   webDist?: string;
+  /** DNS TXT lookup used to verify custom domains (injectable for tests). */
+  resolveTxt?: TxtResolver;
 }
 
 export function createApp(opts: AppOptions) {
@@ -23,7 +27,9 @@ export function createApp(opts: AppOptions) {
   app.set("trust proxy", true);
   app.disable("x-powered-by");
 
-  app.use(subdomainHost(opts.db, opts.appsDomain));
+  app.use(appHost(opts.db, { appsDomain: opts.appsDomain, publicUrl: opts.publicUrl }));
+  // Uploads take raw bodies, so they are mounted before the JSON parser.
+  app.use("/api/apps/:appId/files", uploadsRouter(opts.db));
   app.use(express.json({ limit: "10mb" }));
   app.use(cookieParser());
 
@@ -35,6 +41,7 @@ export function createApp(opts: AppOptions) {
       publicUrl: opts.publicUrl,
       appsDomain: opts.appsDomain,
       secureCookies: opts.publicUrl.startsWith("https://"),
+      resolveTxt: opts.resolveTxt,
     }),
   );
   app.use("/api", (_req, res) => void res.status(404).json({ error: "Not found" }));

@@ -67,5 +67,22 @@
     },
   };
 
-  window.BuildIt = { appId: cfg.appId, mode: cfg.mode, entities: entities, auth: auth };
+  var files = {
+    /** Uploads a File or Blob (max 10 MB). Resolves to { id, url, name, size, content_type, created_at }. */
+    upload: async function (file, opts) {
+      if (!file || typeof file.size !== "number") throw new Error("files.upload expects a File or Blob");
+      var name = (opts && opts.name) || file.name || "file";
+      var headers = { "Content-Type": file.type || "application/octet-stream" };
+      var token = getToken();
+      if (token) headers.Authorization = "Bearer " + token;
+      var res = await fetch(base + "/files?name=" + encodeURIComponent(name), { method: "POST", headers: headers, body: file });
+      var data = null;
+      try { data = await res.json(); } catch (e) { /* empty body */ }
+      if (!res.ok) throw new Error((data && data.error) || "Upload failed (" + res.status + ")");
+      return data;
+    },
+    delete: function (id) { return request("DELETE", "/files/" + encodeURIComponent(id)); },
+  };
+
+  window.BuildIt = { appId: cfg.appId, mode: cfg.mode, entities: entities, auth: auth, files: files };
 })();

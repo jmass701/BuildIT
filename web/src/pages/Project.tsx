@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   api,
+  formatBytes,
   timeAgo,
   type AppFile,
   type DataRecord,
+  type Domain,
   type EntitySchema,
   type ProjectDetail,
+  type UploadedFile,
   type VersionInfo,
+  type Workspace,
 } from "../api";
 import { navigate } from "../App";
 import { Empty, StatusBadge } from "../components";
@@ -336,15 +340,21 @@ function Data({ project }: { project: ProjectDetail }) {
   const [entity, setEntity] = useState<string | null>(null);
   const [rows, setRows] = useState<DataRecord[] | null>(null);
 
+  const loadInfo = useCallback(
+    () =>
+      api.data(project.id).then((d) => {
+        setInfo(d);
+        setEntity((cur) => cur ?? d.entities[0]?.name ?? (d.fileCount ? FILES : null));
+      }),
+    [project.id],
+  );
+
   useEffect(() => {
-    api.data(project.id).then((d) => {
-      setInfo(d);
-      setEntity((cur) => cur ?? d.entities[0]?.name ?? null);
-    });
-  }, [project.id, project.version?.id]);
+    loadInfo();
+  }, [loadInfo, project.version?.id]);
 
   const loadRows = useCallback(() => {
-    if (!entity) return;
+    if (!entity || entity === FILES) return;
     setRows(null);
     api.records(project.id, entity).then(setRows);
   }, [project.id, entity]);
@@ -352,7 +362,7 @@ function Data({ project }: { project: ProjectDetail }) {
   useEffect(loadRows, [loadRows]);
 
   if (!info) return <p className="muted pad">Loading…</p>;
-  if (!info.entities.length) return <Empty>This app doesn't store any data yet.</Empty>;
+  if (!info.entities.length && !info.fileCount) return <Empty>This app doesn't store any data yet.</Empty>;
 
   const schema = info.entities.find((e) => e.name === entity);
   const cols = schema ? Object.keys(schema.fields) : [];
@@ -365,8 +375,14 @@ function Data({ project }: { project: ProjectDetail }) {
             {e.name} <span className="muted">({e.count})</span>
           </button>
         ))}
+        <button className={entity === FILES ? "on" : ""} onClick={() => setEntity(FILES)}>
+          📎 Files <span className="muted">({info.fileCount})</span>
+        </button>
         <p className="muted small pad">{info.userCount} app user(s)</p>
       </div>
+      {entity === FILES ? (
+        <Files project={project} onChange={loadInfo} totalBytes={info.fileBytes} />
+      ) : (
       <div className="table-wrap">
         {schema && (
           <p className="muted small">
@@ -416,6 +432,73 @@ function Data({ project }: { project: ProjectDetail }) {
           </table>
         )}
       </div>
+      )}
+    </div>
+  );
+}
+
+const FILES = "__files";
+const IMAGE = /^image\/(png|jpe?g|gif|webp|avif)$/;
+
+function Files({ project, onChange, totalBytes }: { project: ProjectDetail; onChange: () => void; totalBytes: number }) {
+  const [files, setFiles] = useState<UploadedFile[] | null>(null);
+  const load = useCallback(() => api.files(project.id).then(setFiles), [project.id]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  if (!files) return <p className="muted pad">Loading…</p>;
+  return (
+    <div className="table-wrap">
+      <p className="muted small">
+        Files uploaded through <code>BuildIt.files.upload()</code> · {formatBytes(totalBytes)} of 500 MB used · max 10 MB per file
+      </p>
+      {files.length === 0 ? (
+        <Empty>No files uploaded yet.</Empty>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th />
+              <th>name</th>
+              <th>type</th>
+              <th>size</th>
+              <th>uploaded</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {files.map((f) => (
+              <tr key={f.id}>
+                <td className="fit-col">
+                  {IMAGE.test(f.content_type) ? <img className="thumb" src={f.url} alt="" /> : <span className="thumb icon">📄</span>}
+                </td>
+                <td>
+                  <a href={f.url} target="_blank" rel="noreferrer">
+                    {f.name}
+                  </a>
+                </td>
+                <td className="muted">{f.content_type}</td>
+                <td className="muted">{formatBytes(f.size)}</td>
+                <td className="muted">{timeAgo(f.created_at)}</td>
+                <td>
+                  <button
+                    className="btn ghost small danger"
+                    onClick={async () => {
+                      if (!confirm(`Delete ${f.name}? Records that link to it will show a broken link.`)) return;
+                      await api.deleteFile(project.id, f.id);
+                      load();
+                      onChange();
+                    }}
+                  >
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }
@@ -543,12 +626,18 @@ function Settings({ project, onChange }: { project: ProjectDetail; onChange: () 
         )}
       </div>
 
+      <Domains project={project} />
+
+      <MoveWorkspace project={project} onChange={onChange} />
+
       <div className="card stack">
         <h3>Danger zone</h3>
         <p className="muted small">Deletes the app, all versions, its data and its users. This can't be undone.</p>
         <div>
           <button
             className="btn small danger-solid"
+            disabled={project.role === "member"}
+            title={project.role === "member" ? "Only workspace admins can delete apps" : undefined}
             onClick={async () => {
               if (prompt(`Type "${project.slug}" to delete this app`) !== project.slug) return;
               await api.deleteProject(project.id);
@@ -559,6 +648,184 @@ function Settings({ project, onChange }: { project: ProjectDetail; onChange: () 
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------------- custom domains ----------------
+
+function Domains({ project }: { project: ProjectDetail }) {
+  const [domains, setDomains] = useState<Domain[] | null>(null);
+  const [host, setHost] = useState("");
+  const [msg, setMsg] = useState<{ id?: string; text: string } | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const canManage = project.role !== "member";
+
+  const load = useCallback(() => api.domains(project.id).then(setDomains), [project.id]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const add = async (e: FormEvent) => {
+    e.preventDefault();
+    setMsg(null);
+    try {
+      await api.addDomain(project.id, host);
+      setHost("");
+      load();
+    } catch (err) {
+      setMsg({ text: (err as Error).message });
+    }
+  };
+
+  const verify = async (d: Domain) => {
+    setBusy(d.id);
+    setMsg(null);
+    try {
+      await api.verifyDomain(project.id, d.id);
+      setMsg({ id: d.id, text: "Verified! Your app is served on this domain whenever it's published." });
+      load();
+    } catch (err) {
+      setMsg({ id: d.id, text: (err as Error).message });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="card stack">
+      <h3>Custom domains</h3>
+      <p className="muted small">
+        Serve the published version of this app on your own domain, like <code>app.yourcompany.com</code>.
+      </p>
+      {domains?.map((d) => (
+        <div key={d.id} className="domain">
+          <div className="row between">
+            <span className="row gap">
+              <strong>{d.hostname}</strong>
+              {d.verified ? <span className="badge live">Connected</span> : <span className="badge warn">Pending DNS</span>}
+            </span>
+            <span className="row gap">
+              {d.verified && project.liveUrl && (
+                <a className="btn ghost small" href={d.url} target="_blank" rel="noreferrer">
+                  Open ↗
+                </a>
+              )}
+              {!d.verified && canManage && (
+                <button className="btn primary small" disabled={busy === d.id} onClick={() => verify(d)}>
+                  {busy === d.id ? "Checking…" : "Verify"}
+                </button>
+              )}
+              {canManage && (
+                <button
+                  className="btn ghost small danger"
+                  onClick={async () => {
+                    if (!confirm(`Disconnect ${d.hostname}?`)) return;
+                    await api.removeDomain(project.id, d.id);
+                    load();
+                  }}
+                >
+                  Remove
+                </button>
+              )}
+            </span>
+          </div>
+          {!d.verified && (
+            <>
+              <p className="muted small">Add these records at your DNS provider, then click Verify:</p>
+              <table className="dns">
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Name</th>
+                    <th>Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {d.dns.map((r) => (
+                    <tr key={r.type}>
+                      <td>{r.type}</td>
+                      <td>
+                        <code>{r.name}</code>
+                      </td>
+                      <td>
+                        <code>{r.value}</code>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+          {msg?.id === d.id && <p className={`small ${d.verified ? "ok" : "error"}`}>{msg.text}</p>}
+        </div>
+      ))}
+      {domains && !project.liveUrl && domains.length > 0 && (
+        <p className="muted small">Publish the app to serve it on your domains.</p>
+      )}
+      {canManage ? (
+        <form className="row gap" onSubmit={add}>
+          <input placeholder="app.example.com" value={host} onChange={(e) => setHost(e.target.value)} aria-label="Domain" />
+          <button className="btn primary small" disabled={!host.trim()}>
+            Add domain
+          </button>
+        </form>
+      ) : (
+        <p className="muted small">Only workspace admins can connect domains.</p>
+      )}
+      {msg && !msg.id && <p className="error small">{msg.text}</p>}
+    </div>
+  );
+}
+
+// ---------------- move between workspaces ----------------
+
+function MoveWorkspace({ project, onChange }: { project: ProjectDetail; onChange: () => void }) {
+  const [workspaces, setWorkspaces] = useState<Workspace[] | null>(null);
+  const [target, setTarget] = useState(project.workspaceId);
+  const [msg, setMsg] = useState("");
+  useEffect(() => {
+    api.workspaces().then(setWorkspaces);
+  }, []);
+  if (!workspaces || workspaces.length < 2) return null;
+  const current = workspaces.find((w) => w.id === project.workspaceId);
+
+  return (
+    <div className="card stack">
+      <h3>Workspace</h3>
+      <p className="muted small">
+        This app belongs to <strong>{current?.personal ? "your personal workspace" : current?.name}</strong>. Everyone in a
+        workspace can open and edit its apps.
+      </p>
+      {project.role === "member" ? (
+        <p className="muted small">Only workspace admins can move apps.</p>
+      ) : (
+        <div className="row gap">
+          <select value={target} onChange={(e) => setTarget(e.target.value)} aria-label="Move to workspace">
+            {workspaces.map((w) => (
+              <option key={w.id} value={w.id}>
+                {w.personal ? "Personal" : w.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn ghost small"
+            disabled={target === project.workspaceId}
+            onClick={async () => {
+              try {
+                await api.updateProject(project.id, { workspaceId: target });
+                setMsg("Moved");
+                onChange();
+              } catch (e) {
+                setMsg((e as Error).message);
+              }
+            }}
+          >
+            Move app
+          </button>
+          <span className="small muted">{msg}</span>
+        </div>
+      )}
     </div>
   );
 }

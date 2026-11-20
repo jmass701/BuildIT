@@ -49,6 +49,8 @@ export class TemplateGenerator implements Generator {
         notes: { type: "string" },
         status: { type: "string", enum: ["todo", "in_progress", "done"] },
         due_date: { type: "date" },
+        attachment_url: { type: "string", description: "URL returned by BuildIt.files.upload" },
+        attachment_name: { type: "string" },
       },
     };
     return {
@@ -95,6 +97,7 @@ function indexHtml(appName: string, plural: string) {
         <label>Due <input type="date" name="due_date" /></label>
       </div>
       <label>Notes <textarea name="notes" rows="2"></textarea></label>
+      <label>Attachment <input type="file" name="attachment" /></label>
       <button type="submit">Add</button>
     </form>
     <nav class="filters" id="filters">
@@ -166,9 +169,20 @@ function renderItem(item) {
       el("strong", {}, item.title),
       item.due_date ? el("span", { className: "muted" }, " · due " + item.due_date) : null,
       item.notes ? el("p", { className: "muted" }, item.notes) : null,
+      item.attachment_url ? renderAttachment(item) : null,
     ),
     el("div", { className: "actions" }, status, del),
   );
+}
+
+function renderAttachment(item) {
+  const link = el("a", { href: item.attachment_url, target: "_blank", rel: "noreferrer", className: "attachment" });
+  if (/\\.(png|jpe?g|gif|webp|avif)$/i.test(item.attachment_name || "")) {
+    link.append(el("img", { src: item.attachment_url, alt: item.attachment_name }));
+  } else {
+    link.append("📎 " + (item.attachment_name || "Attachment"));
+  }
+  return link;
 }
 
 form.addEventListener("submit", async (ev) => {
@@ -176,9 +190,16 @@ form.addEventListener("submit", async (ev) => {
   const data = Object.fromEntries(new FormData(form));
   if (!data.title.trim()) return;
   if (!data.due_date) delete data.due_date;
+  const file = data.attachment;
+  delete data.attachment;
   const btn = form.querySelector("button");
   btn.disabled = true;
   try {
+    if (file && file.size) {
+      const uploaded = await window.BuildIt.files.upload(file);
+      data.attachment_url = uploaded.url;
+      data.attachment_name = uploaded.name;
+    }
     await store.create(data);
     form.reset();
     refresh();
@@ -230,5 +251,7 @@ button.ghost { background: transparent; color: var(--danger); }
 .actions { display: flex; gap: 6px; align-items: center; }
 .empty { text-align: center; color: var(--muted); padding: 32px; }
 .error { color: var(--danger); }
+.attachment { display: inline-block; margin-top: 6px; color: var(--accent); font-size: 13px; }
+.attachment img { display: block; max-width: 160px; max-height: 120px; border-radius: 8px; border: 1px solid var(--border); }
 @media (max-width: 520px) { .row { grid-template-columns: 1fr; } .item { flex-direction: column; align-items: stretch; } }
 `;

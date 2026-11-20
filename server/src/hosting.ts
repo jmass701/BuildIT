@@ -2,6 +2,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { type DB, type ProjectRow, type Version, getProject, getVersion } from "./db.ts";
+import { projectForDomain } from "./domains.ts";
 
 const SDK_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "static", "buildit-sdk.js");
 
@@ -112,20 +113,32 @@ export function hostingRouter(db: DB, opts: { appsDomain?: string }) {
   return router;
 }
 
-/** Serves deployed apps on <slug>.<appsDomain>, ahead of all other routes. */
-export function subdomainHost(db: DB, appsDomain: string | undefined) {
+/**
+ * Serves deployed apps on their own origin, ahead of all other routes:
+ *   <slug>.<APPS_DOMAIN>         when APPS_DOMAIN is set
+ *   any verified custom domain   (see domains.ts)
+ * The app's own runtime API and the SDK stay reachable on those hosts.
+ */
+export function appHost(db: DB, opts: { appsDomain?: string; publicUrl: string }) {
+  const platformHost = new URL(opts.publicUrl).host.toLowerCase();
+  const suffix = opts.appsDomain ? `.${opts.appsDomain.toLowerCase()}` : null;
   return (req: Request, res: Response, next: NextFunction) => {
-    if (!appsDomain) return next();
     const host = (req.get("host") ?? "").toLowerCase();
-    const suffix = `.${appsDomain.toLowerCase()}`;
-    if (!host.endsWith(suffix)) return next();
-    const slug = host.slice(0, -suffix.length);
-    if (!slug || slug.includes(".")) return next();
+    if (!host || host === platformHost) return next();
+    let project: ProjectRow | undefined;
+    if (suffix && host.endsWith(suffix)) {
+      const slug = host.slice(0, -suffix.length);
+      if (!slug || slug.includes(".")) return next();
+      project = db.prepare("SELECT * FROM projects WHERE slug = ?").get(slug) as ProjectRow | undefined;
+      if (!project) return void res.status(404).type("text/plain").send("App not found or not published");
+    } else {
+      project = projectForDomain(db, host.replace(/:\d+$/, ""));
+      if (!project) return next(); // not an app host: localhost, 127.0.0.1, the platform's other names...
+    }
     if (req.path.startsWith("/api/apps/") || req.path === "/sdk/buildit.js") return next();
     if (req.method !== "GET" && req.method !== "HEAD") return void res.status(405).end();
-    const project = db.prepare("SELECT * FROM projects WHERE slug = ?").get(slug) as ProjectRow | undefined;
-    const version = project && activeDeployment(db, project.id);
-    if (!project || !version) return void res.status(404).type("text/plain").send("App not found or not published");
+    const version = activeDeployment(db, project.id);
+    if (!version) return void res.status(404).type("text/plain").send("App not found or not published");
     serveFile(req, res, project, version, req.path, { mode: "production", sandbox: false });
   };
 }

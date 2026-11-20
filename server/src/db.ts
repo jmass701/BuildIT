@@ -47,9 +47,38 @@ export function openDb(file: string): DB {
       expires_at TEXT NOT NULL
     );
 
+    -- Team workspaces. Every user has one personal workspace; projects belong to a workspace.
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      personal INTEGER NOT NULL DEFAULT 0,
+      created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS workspace_members (
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      role TEXT NOT NULL,                       -- owner | admin | member
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (workspace_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS workspace_members_user ON workspace_members(user_id);
+
+    CREATE TABLE IF NOT EXISTS workspace_invites (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      role TEXT NOT NULL,                       -- admin | member
+      invited_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(workspace_id, email)
+    );
+
     CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY,
       owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
       name TEXT NOT NULL,
       slug TEXT NOT NULL UNIQUE,
       description TEXT,
@@ -118,8 +147,77 @@ export function openDb(file: string): DB {
       project_id TEXT NOT NULL,
       expires_at TEXT NOT NULL
     );
+
+    -- Files uploaded by generated apps through BuildIt.files.upload()
+    CREATE TABLE IF NOT EXISTS uploads (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      content_type TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      data BLOB NOT NULL,
+      created_by TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS uploads_project ON uploads(project_id, created_at);
+
+    -- Custom domains pointed at a project's live deployment
+    CREATE TABLE IF NOT EXISTS domains (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      hostname TEXT NOT NULL,
+      verification_token TEXT NOT NULL,
+      verified_at TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(project_id, hostname)
+    );
+    CREATE INDEX IF NOT EXISTS domains_hostname ON domains(hostname);
   `);
+  migrate(db);
   return db;
+}
+
+/** Upgrades databases created before workspaces existed. Safe to run on every start. */
+function migrate(db: DB) {
+  const cols = db.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "workspace_id")) {
+    db.exec("ALTER TABLE projects ADD COLUMN workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS projects_workspace ON projects(workspace_id, updated_at)");
+  const orphans = db.prepare("SELECT DISTINCT owner_id FROM projects WHERE workspace_id IS NULL").all() as { owner_id: string }[];
+  for (const { owner_id } of orphans) {
+    const ws = ensurePersonalWorkspace(db, owner_id);
+    db.prepare("UPDATE projects SET workspace_id = ? WHERE owner_id = ? AND workspace_id IS NULL").run(ws, owner_id);
+  }
+}
+
+// ---------- workspaces ----------
+
+export type Role = "owner" | "admin" | "member";
+const RANK: Record<Role, number> = { member: 1, admin: 2, owner: 3 };
+export const atLeast = (role: Role | null, min: Role) => !!role && RANK[role] >= RANK[min];
+
+/** Returns the id of the user's personal workspace, creating it if needed. */
+export function ensurePersonalWorkspace(db: DB, userId: string): string {
+  const row = db
+    .prepare(
+      "SELECT w.id FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id WHERE w.personal = 1 AND m.user_id = ? AND m.role = 'owner'",
+    )
+    .get(userId) as { id: string } | undefined;
+  if (row) return row.id;
+  const id = newId();
+  const ts = now();
+  db.prepare("INSERT INTO workspaces (id, name, personal, created_by, created_at) VALUES (?, 'Personal', 1, ?, ?)").run(id, userId, ts);
+  db.prepare("INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)").run(id, userId, ts);
+  return id;
+}
+
+export function memberRole(db: DB, workspaceId: string | null, userId: string): Role | null {
+  if (!workspaceId) return null;
+  const row = db.prepare("SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?").get(workspaceId, userId) as
+    | { role: Role }
+    | undefined;
+  return row?.role ?? null;
 }
 
 // ---------- password + token helpers ----------
@@ -145,6 +243,7 @@ export const newToken = () => crypto.randomBytes(32).toString("base64url");
 export interface ProjectRow {
   id: string;
   owner_id: string;
+  workspace_id: string;
   name: string;
   slug: string;
   description: string | null;

@@ -149,6 +149,20 @@ interface AppUserRow {
   password_hash: string;
   created_at: string;
 }
+/** The signed-in end user of a generated app, from its bearer token. */
+export function appUserFromRequest(db: DB, req: Request, projectId: string): AppUserRow | null {
+  const m = /^Bearer (.+)$/.exec(req.get("authorization") ?? "");
+  if (!m) return null;
+  return (
+    (db
+      .prepare(
+        `SELECT u.* FROM app_sessions s JOIN app_users u ON u.id = s.app_user_id
+         WHERE s.token = ? AND s.project_id = ? AND s.expires_at > ?`,
+      )
+      .get(m[1], projectId, now()) as AppUserRow | undefined) ?? null
+  );
+}
+
 const publicUser = (u: AppUserRow) => ({ id: u.id, email: u.email, name: u.name, created_at: u.created_at });
 
 export function runtimeRouter(db: DB) {
@@ -168,18 +182,7 @@ export function runtimeRouter(db: DB) {
     return project;
   };
 
-  const appUser = (req: Request, projectId: string): AppUserRow | null => {
-    const m = /^Bearer (.+)$/.exec(req.get("authorization") ?? "");
-    if (!m) return null;
-    return (
-      (db
-        .prepare(
-          `SELECT u.* FROM app_sessions s JOIN app_users u ON u.id = s.app_user_id
-           WHERE s.token = ? AND s.project_id = ? AND s.expires_at > ?`,
-        )
-        .get(m[1], projectId, now()) as AppUserRow | undefined) ?? null
-    );
-  };
+  const appUser = (req: Request, projectId: string) => appUserFromRequest(db, req, projectId);
 
   const startSession = (userId: string, projectId: string) => {
     const token = newToken();
@@ -317,6 +320,8 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
   if (err instanceof HttpError) return void res.status(err.status).json({ error: err.message });
   if (err && typeof err === "object" && "type" in err && (err as { type: string }).type === "entity.parse.failed")
     return void res.status(400).json({ error: "Invalid JSON body" });
+  if (err && typeof err === "object" && "type" in err && (err as { type: string }).type === "entity.too.large")
+    return void res.status(413).json({ error: "File or request is too large" });
   console.error(err);
   res.status(500).json({ error: "Internal server error" });
 }

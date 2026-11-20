@@ -1,5 +1,5 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { api, timeAgo, type ProjectSummary, type User } from "../api";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { api, savedWorkspace, timeAgo, type MyInvite, type ProjectSummary, type User, type Workspace } from "../api";
 import { navigate } from "../App";
 import { Empty, Logo, StatusBadge } from "../components";
 
@@ -11,14 +11,34 @@ const IDEAS = [
 ];
 
 export function Dashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
+  const [workspaces, setWorkspaces] = useState<Workspace[] | null>(null);
+  const [wsId, setWsId] = useState<string | null>(null);
+  const [invites, setInvites] = useState<MyInvite[]>([]);
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [prompt, setPrompt] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    api.projects().then(setProjects).catch((e) => setError(e.message));
+  const loadWorkspaces = useCallback(async (select?: string) => {
+    const [list, mine] = await Promise.all([api.workspaces(), api.myInvites()]);
+    setWorkspaces(list);
+    setInvites(mine);
+    const want = select ?? savedWorkspace.get();
+    setWsId(list.find((w) => w.id === want)?.id ?? list[0]?.id ?? null);
   }, []);
+
+  useEffect(() => {
+    loadWorkspaces().catch((e) => setError(e.message));
+  }, [loadWorkspaces]);
+
+  useEffect(() => {
+    if (!wsId) return;
+    savedWorkspace.set(wsId);
+    setProjects(null);
+    api.projects(wsId).then(setProjects).catch((e) => setError(e.message));
+  }, [wsId]);
+
+  const workspace = workspaces?.find((w) => w.id === wsId);
 
   const create = async (e?: FormEvent) => {
     e?.preventDefault();
@@ -26,7 +46,7 @@ export function Dashboard({ user, onLogout }: { user: User; onLogout: () => void
     setBusy(true);
     setError("");
     try {
-      const p = await api.createProject(prompt);
+      const p = await api.createProject(prompt, wsId ?? undefined);
       navigate(`/projects/${p.id}`);
     } catch (err) {
       setError((err as Error).message);
@@ -34,12 +54,57 @@ export function Dashboard({ user, onLogout }: { user: User; onLogout: () => void
     }
   };
 
+  const newWorkspace = async () => {
+    const name = window.prompt("Name your team workspace (e.g. your company or team)");
+    if (!name?.trim()) return;
+    try {
+      const w = await api.createWorkspace(name);
+      await loadWorkspaces(w.id);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const answer = async (invite: MyInvite, accept: boolean) => {
+    try {
+      if (accept) await api.acceptInvite(invite.id);
+      else await api.declineInvite(invite.id);
+      await loadWorkspaces(accept ? invite.workspaceId : wsId ?? undefined);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
   return (
     <div className="page">
       <header className="topbar">
-        <Logo />
         <div className="row gap">
-          <span className="muted small">{user.name || user.email}</span>
+          <Logo />
+          {workspaces && (
+            <div className="row gap ws-switch">
+              <select
+                aria-label="Workspace"
+                value={wsId ?? ""}
+                onChange={(e) => (e.target.value === "__new" ? newWorkspace() : setWsId(e.target.value))}
+              >
+                {workspaces.map((w) => (
+                  <option key={w.id} value={w.id}>
+                    {w.personal ? "Personal" : w.name}
+                    {w.personal ? "" : ` · ${w.memberCount} member${w.memberCount === 1 ? "" : "s"}`}
+                  </option>
+                ))}
+                <option value="__new">+ New team workspace…</option>
+              </select>
+              {workspace && !workspace.personal && (
+                <button className="btn ghost small" onClick={() => navigate(`/workspaces/${workspace.id}`)}>
+                  Team
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="row gap">
+          <span className="muted small hide-sm">{user.name || user.email}</span>
           <button className="btn ghost" onClick={onLogout}>
             Sign out
           </button>
@@ -47,6 +112,27 @@ export function Dashboard({ user, onLogout }: { user: User; onLogout: () => void
       </header>
 
       <main className="dash">
+        {invites.length > 0 && (
+          <section className="stack">
+            {invites.map((i) => (
+              <div key={i.id} className="card invite row between">
+                <span>
+                  <strong>{i.invitedBy || i.invitedByEmail || "Someone"}</strong> invited you to join{" "}
+                  <strong>{i.workspaceName}</strong> as {i.role === "admin" ? "an admin" : "a member"}.
+                </span>
+                <span className="row gap">
+                  <button className="btn ghost small" onClick={() => answer(i, false)}>
+                    Decline
+                  </button>
+                  <button className="btn primary small" onClick={() => answer(i, true)}>
+                    Join workspace
+                  </button>
+                </span>
+              </div>
+            ))}
+          </section>
+        )}
+
         <section className="hero">
           <h1>What do you want to build?</h1>
           <form onSubmit={create} className="prompt-box">
@@ -60,7 +146,9 @@ export function Dashboard({ user, onLogout }: { user: User; onLogout: () => void
               }}
             />
             <div className="row between">
-              <span className="muted small">⌘/Ctrl + Enter to build</span>
+              <span className="muted small">
+                {workspace && !workspace.personal ? `Builds in ${workspace.name} · ` : ""}⌘/Ctrl + Enter to build
+              </span>
               <button className="btn primary" disabled={busy || !prompt.trim()}>
                 {busy ? "Starting…" : "Build it"}
               </button>
@@ -77,7 +165,7 @@ export function Dashboard({ user, onLogout }: { user: User; onLogout: () => void
         </section>
 
         <section>
-          <h2>Your apps</h2>
+          <h2>{workspace && !workspace.personal ? `${workspace.name} apps` : "Your apps"}</h2>
           {projects === null ? (
             <p className="muted">Loading…</p>
           ) : projects.length === 0 ? (

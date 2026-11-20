@@ -4,8 +4,12 @@ import {
   type DB,
   type EntitySchema,
   type ProjectRow,
+  type Role,
   type VersionRow,
   addMessage,
+  atLeast,
+  ensurePersonalWorkspace,
+  memberRole,
   createVersion,
   getProject,
   getVersion,
@@ -19,6 +23,17 @@ import {
 import { HttpError, listRecords, projectEntities } from "./runtime.ts";
 import { type Generator, sanitizeEntities, sanitizeFiles } from "./generator/index.ts";
 import { versionUrl } from "./hosting.ts";
+import { workspaceRoutes } from "./workspaces.ts";
+import { listUploads, fileUrl } from "./uploads.ts";
+import {
+  type DomainRow,
+  type TxtResolver,
+  addDomain,
+  defaultResolveTxt,
+  domainView,
+  listDomains,
+  verifyDomain,
+} from "./domains.ts";
 
 const COOKIE = "bi_session";
 const SESSION_DAYS = 14;
@@ -42,6 +57,7 @@ export interface BuilderOptions {
   publicUrl: string;
   appsDomain?: string;
   secureCookies: boolean;
+  resolveTxt?: TxtResolver;
 }
 
 export function builderRouter(db: DB, opts: BuilderOptions) {
@@ -83,6 +99,7 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
       hashPassword(password),
       now(),
     );
+    ensurePersonalWorkspace(db, id);
     startSession(res, id);
     res.status(201).json({ user: { id, email: normalized, name: name ?? null } });
   });
@@ -109,8 +126,23 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
     res.json({ user: req.user ?? null });
   });
 
+  const platformHost = new URL(opts.publicUrl).host;
+  // Hostname custom domains should CNAME to (no port).
+  const domainTarget = new URL(opts.publicUrl).hostname;
+
   router.get("/config", (_req, res) => {
-    res.json({ generatorMode: opts.generator.mode, appsDomain: opts.appsDomain ?? null });
+    res.json({ generatorMode: opts.generator.mode, appsDomain: opts.appsDomain ?? null, domainTarget });
+  });
+
+  // For a TLS terminator with on-demand certificates (e.g. Caddy's on_demand_tls "ask"):
+  // 200 if BuildIT serves this hostname, 404 otherwise, so certificates are only issued for real apps.
+  router.get("/domains/check", (req, res) => {
+    const host = String(req.query.domain ?? "").toLowerCase();
+    const apps = opts.appsDomain?.toLowerCase().replace(/:\d+$/, "");
+    const ok =
+      (apps && host.endsWith(`.${apps}`) && db.prepare("SELECT 1 FROM projects WHERE slug = ?").get(host.slice(0, -apps.length - 1))) ||
+      db.prepare("SELECT 1 FROM domains WHERE hostname = ? AND verified_at IS NOT NULL").get(host);
+    res.status(ok ? 200 : 404).json({ ok: !!ok });
   });
 
   // ---------------- projects ----------------
@@ -119,10 +151,22 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
     next();
   };
 
-  const ownProject = (req: Request): ProjectRow => {
+  /** Loads a project the signed-in user can reach through workspace membership. */
+  const ownProject = (req: Request, min: Role = "member"): ProjectRow & { role: Role } => {
     const project = getProject(db, String(req.params.id));
-    if (!project || project.owner_id !== req.user!.id) throw new HttpError(404, "Project not found");
-    return project;
+    const role = project ? memberRole(db, project.workspace_id, req.user!.id) : null;
+    if (!project || !role) throw new HttpError(404, "Project not found");
+    if (!atLeast(role, min)) throw new HttpError(403, `Only workspace ${min}s can do that`);
+    return { ...project, role };
+  };
+
+  /** The workspace a request targets: an explicit id the user belongs to, or their personal one. */
+  const targetWorkspace = (req: Request, explicit: unknown): string => {
+    if (typeof explicit === "string" && explicit) {
+      if (!memberRole(db, explicit, req.user!.id)) throw new HttpError(404, "Workspace not found");
+      return explicit;
+    }
+    return ensurePersonalWorkspace(db, req.user!.id);
   };
 
   const activeDeployment = (projectId: string) =>
@@ -141,6 +185,7 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
     const live = activeDeployment(p.id);
     return {
       id: p.id,
+      workspaceId: p.workspace_id,
       name: p.name,
       slug: p.slug,
       description: p.description,
@@ -199,9 +244,10 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
   };
 
   router.get("/projects", requireUser, (req, res) => {
+    const workspaceId = targetWorkspace(req, req.query.workspaceId);
     const rows = db
-      .prepare("SELECT * FROM projects WHERE owner_id = ? ORDER BY updated_at DESC")
-      .all(req.user!.id) as unknown as ProjectRow[];
+      .prepare("SELECT * FROM projects WHERE workspace_id = ? ORDER BY updated_at DESC")
+      .all(workspaceId) as unknown as ProjectRow[];
     res.json(rows.map(summarize));
   });
 
@@ -211,11 +257,12 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
     if (prompt.length > 20_000) throw new HttpError(400, "Prompt is too long");
     const explicitName = typeof req.body?.name === "string" && req.body.name.trim() ? req.body.name.trim().slice(0, 80) : null;
     const name = explicitName ?? prompt.split(/\s+/).slice(0, 5).join(" ").slice(0, 60);
+    const workspaceId = targetWorkspace(req, req.body?.workspaceId);
     const id = newId();
     const ts = now();
     db.prepare(
-      "INSERT INTO projects (id, owner_id, name, slug, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'idle', ?, ?)",
-    ).run(id, req.user!.id, name, uniqueSlug(db, name), prompt.slice(0, 500), ts, ts);
+      "INSERT INTO projects (id, owner_id, workspace_id, name, slug, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'idle', ?, ?)",
+    ).run(id, req.user!.id, workspaceId, name, uniqueSlug(db, name), prompt.slice(0, 500), ts, ts);
     addMessage(db, id, "user", prompt);
     runGeneration(id, prompt, !explicitName);
     res.status(201).json(summarize(getProject(db, id)!));
@@ -229,6 +276,7 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
       .all(project.id);
     res.json({
       ...summarize(project),
+      role: project.role,
       generatorMode: opts.generator.mode,
       version,
       messages,
@@ -245,12 +293,24 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
       if (db.prepare("SELECT 1 FROM projects WHERE slug = ?").get(req.body.slug)) throw new HttpError(409, "That URL is taken");
       slug = req.body.slug;
     }
-    db.prepare("UPDATE projects SET name = ?, slug = ?, updated_at = ? WHERE id = ?").run(name, slug, now(), project.id);
+    let workspaceId = project.workspace_id;
+    if (typeof req.body?.workspaceId === "string" && req.body.workspaceId !== project.workspace_id) {
+      if (!atLeast(project.role, "admin")) throw new HttpError(403, "Only workspace admins can move apps");
+      if (!memberRole(db, req.body.workspaceId, req.user!.id)) throw new HttpError(404, "Workspace not found");
+      workspaceId = req.body.workspaceId;
+    }
+    db.prepare("UPDATE projects SET name = ?, slug = ?, workspace_id = ?, updated_at = ? WHERE id = ?").run(
+      name,
+      slug,
+      workspaceId,
+      now(),
+      project.id,
+    );
     res.json(summarize(getProject(db, project.id)!));
   });
 
   router.delete("/projects/:id", requireUser, (req, res) => {
-    const project = ownProject(req);
+    const project = ownProject(req, "admin");
     db.prepare("DELETE FROM app_sessions WHERE project_id = ?").run(project.id);
     db.prepare("DELETE FROM projects WHERE id = ?").run(project.id);
     res.json({ ok: true });
@@ -365,9 +425,14 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
       ).map((r) => [r.entity, r.n]),
     );
     const users = db.prepare("SELECT COUNT(*) AS n FROM app_users WHERE project_id = ?").get(project.id) as { n: number };
+    const files = db
+      .prepare("SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM uploads WHERE project_id = ?")
+      .get(project.id) as { n: number; bytes: number };
     res.json({
       entities: projectEntities(db, project).map((e) => ({ ...e, count: counts.get(e.name) ?? 0 })),
       userCount: users.n,
+      fileCount: files.n,
+      fileBytes: files.bytes,
     });
   });
 
@@ -385,6 +450,53 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
     );
     res.json({ ok: true });
   });
+
+  // ---------------- uploaded files ----------------
+  router.get("/projects/:id/files", requireUser, (req, res) => {
+    const project = ownProject(req);
+    const origin = `${req.protocol}://${req.get("host")}`;
+    res.json(listUploads(db, project.id).map((f) => ({ ...f, url: fileUrl(origin, project.id, f) })));
+  });
+
+  router.delete("/projects/:id/files/:fileId", requireUser, (req, res) => {
+    const project = ownProject(req);
+    db.prepare("DELETE FROM uploads WHERE id = ? AND project_id = ?").run(String(req.params.fileId), project.id);
+    res.json({ ok: true });
+  });
+
+  // ---------------- custom domains ----------------
+  const view = (d: DomainRow) => domainView(d, { target: domainTarget, publicUrl: opts.publicUrl });
+  const ownDomain = (req: Request) => {
+    const project = ownProject(req, "admin");
+    const d = db.prepare("SELECT * FROM domains WHERE id = ? AND project_id = ?").get(String(req.params.domainId), project.id) as
+      | DomainRow
+      | undefined;
+    if (!d) throw new HttpError(404, "Domain not found");
+    return d;
+  };
+
+  router.get("/projects/:id/domains", requireUser, (req, res) => {
+    const project = ownProject(req);
+    res.json(listDomains(db, project.id).map(view));
+  });
+
+  router.post("/projects/:id/domains", requireUser, (req, res) => {
+    const project = ownProject(req, "admin");
+    const d = addDomain(db, project, req.body?.hostname, { platformHost, appsDomain: opts.appsDomain });
+    res.status(201).json(view(d));
+  });
+
+  router.post("/projects/:id/domains/:domainId/verify", requireUser, async (req, res) => {
+    const d = await verifyDomain(db, ownDomain(req), opts.resolveTxt ?? defaultResolveTxt);
+    res.json(view(d));
+  });
+
+  router.delete("/projects/:id/domains/:domainId", requireUser, (req, res) => {
+    db.prepare("DELETE FROM domains WHERE id = ?").run(ownDomain(req).id);
+    res.json({ ok: true });
+  });
+
+  workspaceRoutes(router, db, requireUser);
 
   return router;
 }

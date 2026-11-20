@@ -30,7 +30,12 @@ await auth.register({ email, password, name });  // -> user, signs in
 await auth.login({ email, password });           // -> user
 await auth.me();                                 // -> user or null
 await auth.logout();
+
+const f = await BuildIt.files.upload(fileInput.files[0]);  // File or Blob, max 10 MB
+// -> { id, url, name, size, content_type }; store f.url (and f.name) in a string field
+await BuildIt.files.delete(f.id);
 \`\`\`
+For file attachments, photos, avatars or documents: upload with \`files.upload\` and save the returned \`url\` in a string field; render images with \`<img src=url>\` and other files as download links.
 Field types: string, number, boolean, date (ISO 8601 string), json (any JSON value). Entity names are PascalCase singular (\`Task\`, \`Customer\`); field names are snake_case. Only use auth if the app genuinely needs per-user accounts; data is shared by all users of the app unless you filter by \`created_by\`.
 
 ## Quality bar
