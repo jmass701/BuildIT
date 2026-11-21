@@ -1,0 +1,34 @@
+# BuildIT behind Caddy (automatic HTTPS). Run from this folder:
+#   cp .env.example .env   # then fill it in
+#   docker compose up -d --build
+services:
+  buildit:
+    build: ..
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "3000"
+      DATA_DIR: /data
+    volumes:
+      - buildit-data:/data
+
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      BUILDIT_DOMAIN: ${BUILDIT_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - buildit
+
+volumes:
+  buildit-data:
+  caddy-data:
+  caddy-config:
