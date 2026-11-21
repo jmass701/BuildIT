@@ -1,0 +1,27 @@
+# Certificates for the builder itself, plus on-demand certificates for published apps
+# (<slug>.apps.<domain>) and verified custom domains. BuildIT's /api/domains/check
+# answers 200 only for hosts it actually serves, so Caddy can't be tricked into
+# requesting certificates for arbitrary names.
+{
+	on_demand_tls {
+		ask http://buildit:3000/api/domains/check
+	}
+}
+
+{$BUILDIT_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy buildit:3000
+}
+
+www.{$BUILDIT_DOMAIN} {
+	redir https://{$BUILDIT_DOMAIN}{uri} permanent
+}
+
+# Published apps and custom domains.
+https:// {
+	tls {
+		on_demand
+	}
+	encode zstd gzip
+	reverse_proxy buildit:3000
+}

@@ -39,6 +39,24 @@ docker build -t buildit . && docker run -p 3000:3000 -v buildit-data:/data -e AN
 
 Tests: `npm test` (end-to-end over HTTP: auth, generation, preview, runtime data API, app auth, versions, deploy, subdomain hosting, file uploads, custom domain verification and hosting (with a stubbed DNS resolver), workspaces/roles/invites, the pre-workspaces database migration, and the Claude request/response handling with a stubbed client).
 
+## Deploying on your own domain
+
+`deploy/` has a Docker Compose setup that runs BuildIT behind [Caddy](https://caddyserver.com) with automatic HTTPS.
+On a Linux server with Docker and a public IP:
+
+1. DNS: point `yourdomain.com`, `www.yourdomain.com` and `*.apps.yourdomain.com` (A records) at the server.
+2. Clone this repo on the server, then:
+   ```bash
+   cd deploy
+   cp .env.example .env    # set BUILDIT_DOMAIN, PUBLIC_URL, APPS_DOMAIN, ALLOWED_SIGNUP_EMAILS, ANTHROPIC_API_KEY
+   docker compose up -d --build
+   ```
+3. Open `https://yourdomain.com` and sign up with an allowed email.
+
+Caddy gets a certificate for the builder domain at start-up, and on-demand certificates for each published app
+(`<slug>.apps.yourdomain.com`) and verified custom domain the first time it's visited. Data lives in the
+`buildit-data` volume (back it up: it's one SQLite file plus WAL). Update with `git pull && docker compose up -d --build`.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -48,20 +66,15 @@ Tests: `npm test` (end-to-end over HTTP: auth, generation, preview, runtime data
 | `PORT` | `3000` | HTTP port. |
 | `DATA_DIR` | `./data` | Where the SQLite database lives. |
 | `PUBLIC_URL` | `http://localhost:$PORT` | Base URL used in links; `https://` also turns on secure cookies. |
+| `ALLOWED_SIGNUP_EMAILS` | – | Who may create a builder account: emails and/or domains, comma separated (`me@gmail.com, @mycompany.com`; a bare `mycompany.com` also means the whole domain). People with a pending workspace invitation can always sign up. Empty = anyone, so **set this on any public server**: every build spends your Anthropic credits. |
 | `APPS_DOMAIN` | – | Serve published apps at `<slug>.<APPS_DOMAIN>` (needs a wildcard DNS record + TLS cert). `localhost:3000` works for local dev in most browsers. |
 
 ### Custom domains and TLS
 
-Custom domains are told to CNAME to the host in `PUBLIC_URL`. BuildIT serves plain HTTP; for HTTPS on custom
-domains put a TLS terminator with on-demand certificates in front. With Caddy:
-
-```
-{ on_demand_tls { ask http://localhost:3000/api/domains/check } }
-https:// { tls { on_demand } reverse_proxy localhost:3000 }
-```
-
-`/api/domains/check?domain=…` answers 200 only for verified custom domains and existing `<slug>.<APPS_DOMAIN>` hosts,
-so certificates are only issued for real apps.
+Custom domains are told to CNAME to the host in `PUBLIC_URL`. BuildIT serves plain HTTP; HTTPS comes from a TLS
+terminator in front with on-demand certificates, as in `deploy/Caddyfile`. Its `ask` endpoint,
+`/api/domains/check?domain=…`, answers 200 only for verified custom domains and existing `<slug>.<APPS_DOMAIN>`
+hosts, so certificates are only issued for real apps.
 
 ### Workspace roles
 

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { api, type User } from "../api";
 import { Logo } from "../components";
 
@@ -9,6 +9,14 @@ export function AuthPage({ onAuth }: { onAuth: (u: User) => void }) {
   const [name, setName] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [inviteOnly, setInviteOnly] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/config")
+      .then((r) => r.json())
+      .then((c) => setInviteOnly(!!c.signupRestricted))
+      .catch(() => {});
+  }, []);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -56,6 +64,9 @@ export function AuthPage({ onAuth }: { onAuth: (u: User) => void }) {
             autoComplete={mode === "login" ? "current-password" : "new-password"}
           />
         </label>
+        {mode === "register" && inviteOnly && (
+          <p className="muted small">Sign-up is invite-only. Use the email address you were invited with.</p>
+        )}
         {error && <p className="error">{error}</p>}
         <button className="btn primary" disabled={busy}>
           {busy ? "…" : mode === "login" ? "Sign in" : "Create account"}

@@ -20,6 +20,11 @@ export interface AppOptions {
   webDist?: string;
   /** DNS TXT lookup used to verify custom domains (injectable for tests). */
   resolveTxt?: TxtResolver;
+  /**
+   * Who may create a builder account: exact emails ("ann@acme.com") and/or whole domains ("@acme.com").
+   * Undefined or empty = anyone. People with a pending workspace invitation may always sign up.
+   */
+  allowedSignups?: string[];
 }
 
 export function createApp(opts: AppOptions) {
@@ -42,6 +47,7 @@ export function createApp(opts: AppOptions) {
       appsDomain: opts.appsDomain,
       secureCookies: opts.publicUrl.startsWith("https://"),
       resolveTxt: opts.resolveTxt,
+      allowedSignups: opts.allowedSignups,
     }),
   );
   app.use("/api", (_req, res) => void res.status(404).json({ error: "Not found" }));

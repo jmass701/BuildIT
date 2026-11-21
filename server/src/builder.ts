@@ -58,6 +58,16 @@ export interface BuilderOptions {
   appsDomain?: string;
   secureCookies: boolean;
   resolveTxt?: TxtResolver;
+  allowedSignups?: string[];
+}
+
+/** Parses ALLOWED_SIGNUP_EMAILS: comma/space separated emails and "@domain" entries. */
+export function parseSignupAllowlist(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .map((s) => (s.includes("@") ? s : `@${s}`)); // a bare "acme.com" means the whole domain
 }
 
 export function builderRouter(db: DB, opts: BuilderOptions) {
@@ -84,11 +94,20 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
     res.cookie(COOKIE, token, { httpOnly: true, sameSite: "lax", secure: opts.secureCookies, expires, path: "/" });
   };
 
+  const allowlist = opts.allowedSignups?.map((s) => s.toLowerCase()).filter(Boolean) ?? [];
+  const signupRestricted = allowlist.length > 0;
+  const maySignUp = (email: string) =>
+    !signupRestricted ||
+    allowlist.some((entry) => (entry.startsWith("@") ? email.endsWith(entry) : email === entry)) ||
+    !!db.prepare("SELECT 1 FROM workspace_invites WHERE email = ?").get(email);
+
   router.post("/auth/register", (req, res) => {
     const { email, password, name } = req.body ?? {};
     if (typeof email !== "string" || !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, "A valid email is required");
     if (typeof password !== "string" || password.length < 8) throw new HttpError(400, "Password must be at least 8 characters");
     const normalized = email.trim().toLowerCase();
+    if (!maySignUp(normalized))
+      throw new HttpError(403, "Sign-up is invite-only on this BuildIT. Ask an admin to invite your email address.");
     if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(normalized))
       throw new HttpError(409, "An account with this email already exists");
     const id = newId();
@@ -131,7 +150,7 @@ export function builderRouter(db: DB, opts: BuilderOptions) {
   const domainTarget = new URL(opts.publicUrl).hostname;
 
   router.get("/config", (_req, res) => {
-    res.json({ generatorMode: opts.generator.mode, appsDomain: opts.appsDomain ?? null, domainTarget });
+    res.json({ generatorMode: opts.generator.mode, appsDomain: opts.appsDomain ?? null, domainTarget, signupRestricted });
   });
 
   // For a TLS terminator with on-demand certificates (e.g. Caddy's on_demand_tls "ask"):
